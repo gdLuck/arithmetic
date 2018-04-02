@@ -18,7 +18,9 @@
 用户大奖步长与连续不中计数
 > 用户ID | 奖品ID | 步长累加值
 奖品记录
-> 用户ID | 奖品
+> 用户ID | 奖品ID | 其他信息
+领取统计
+> 用户ID | 奖励ID
  * author: gtb
  * Date: 2018/3/28
  * Time: 18:35
@@ -61,37 +63,38 @@ class roulette
      * @param $user 抽奖用户信息
      * //测试用 不考虑并发
      */
-    public function run($user)
+    public function run($user):array
     {
-        $_config = $this->getConfig();
-        // 生成随机值
-        $randNum = mt_rand(1, 81100);
-echo $randNum.PHP_EOL;
-        // 判断是否首抽
-        //...
-        // 判断是否连续十次不中
-        //...
-        // 判断正常抽法
-        $key = $this->awardSearch($_config, $randNum);
-        if ($key == false) return '谢谢参与！';
+        try {
+            $_config = $this->getConfig();
+            // 生成随机值
+            $randNum = mt_rand(1, 81100);
+            //if($randNum > 8100 && $randNum <= 8110) echo $randNum.PHP_EOL;
+            // 判断是否首抽
+            //...
+            // 判断是否连续十次不中
+            //...
+            // 判断正常抽法
+            $key = $this->awardSearch($_config, $randNum);
+            if ($key == -1) return [];
 
-        $award = $_config[$key];
-
-        //验证库存（可直接更新数据库表，判断库存大于0才更新，否则返回未抽中）
-        if ($award['stock'] > 0) {
-            // 验证阈值
-            if ($award['doorsill'] > 0) {
-                if (!$this->checkStepSize($award, $user)) return '谢谢参与';
+            $award = $_config[$key];
+            //验证库存（可直接更新数据库表，判断库存大于0才更新，否则返回未抽中）
+            if ($award['stock'] > 0) {
+                // 验证阈值
+                if ($award['doorsill'] > 0) {
+                    if (!$this->checkStepSize($award, $user)) return [];
+                }
+                //更新库存
+                $_config[$key]['stock'] -= 1;
+                db::getRedis()->set($this->configKey, json_encode($_config));
+                return $award;
             }
-            //更新库存
-            $_config[$key]['stock'] -= 1;
-            db::getRedis()->set($this->configKey, json_encode($_config));
-
-        } elseif ($award['stock'] != -1) {
-            return '谢谢参与';
+        }catch (Exception $e){
+            throw new Exception($e->getMessage());
         }
 
-        return $award['name'];
+        return [];
     }
 
     private function getConfig(): array
@@ -109,20 +112,17 @@ echo $randNum.PHP_EOL;
      */
     public function checkStepSize($award, $user)
     {
-        $stepSize = mt_rand($award['stepSize'][0], $award['stepSize'][0]);
+        $stepSize = mt_rand($award['stepSize'][0], $award['stepSize'][1]);
         if ($stepSize >= $award['doorsill']) {
             return true;
         }
-        $stepSizeKey = 'test::stepSize_' . $user['name'] . '_' . $award['id'];
-        if (!$oldValue = db::getRedis()->get($stepSizeKey)) {
-            db::getRedis()->set($stepSizeKey, $stepSize);
-            return false;
-        }
-
-        if ( ($oldValue + $stepSize) >= $award['doorsill']){
+        $stepSizeKey = 'test::stepSize_' . $user['uid'] . '_' . $award['id'];
+        $newValue = intval(db::getRedis()->get($stepSizeKey)) + $stepSize;
+        if ( $newValue >= $award['doorsill']){
             db::getRedis()->set($stepSizeKey, 0); //重置
             return true;
         }
+        db::getRedis()->set($stepSizeKey, $newValue);
         return false;
     }
 
@@ -130,25 +130,22 @@ echo $randNum.PHP_EOL;
      * 查询中奖情况
      * @param $configArr 奖品列表
      * @param $randNum
-     * @return bool | int
+     * @return int
      */
-    private function awardSearch($configArr, $randNum)
+    private function awardSearch(array $configArr, int $randNum):int
     {
-        if (empty($configArr)) return false;
+        if (empty($configArr)) return -1;
 
         $low = 0;
         $high = count($configArr)-1;
 
         while ($low <= $high){
             $mid = floor(($low + $high)/2);
-            echo $mid.'=';
-            if ($configArr[$mid]['range'][0] > $randNum && $randNum <= $configArr[$mid]['range'][1]) return $mid;
+            if ($configArr[$mid]['range'][0] < $randNum && $randNum <= $configArr[$mid]['range'][1]) return $mid;
             elseif ($configArr[$mid]['range'][1] < $randNum) $low = $mid + 1;
             else $high = $mid -1;
-            echo $low.'-'.$high.PHP_EOL;
         }
-pr($mid);
-        return false;
+        return -1;
     }
 
     //首次单抽
@@ -172,12 +169,17 @@ class db
             return $redis;
         }
 
-        $redis = new Redis();
-        $redis->connect('127.0.0.1', 6379);
-        $redis->auth('aaa123');
+        try {
+            $redis = new Redis();
+            $redis->connect('127.0.0.1', 6379);
+            $redis->auth('aaa123');
 
-        if ($redis->ping() != '+PONG')
+            if ($redis->ping() != '+PONG')
+                throw new Exception('redis 连接失败！');
+        }catch (Exception $e){
             throw new Exception('redis 连接失败！');
+        }
+
         return $redis;
     }
 }
@@ -191,15 +193,83 @@ function pr($arr, $is = true)
 echo "<pre>";
 // 用户与未中奖数
 $user = [
+    'uid' => 1,
     'num' => 0,
     'name' => 'gtb'
 ];
 
 //验证用户抽奖权限
-//抽奖
-$result = roulette::factory()->run($user);
-//记录更新
 
-var_dump($result);
+//抽奖
+$error = 0;
+$run   = 10000;
+$redis = db::getRedis();
+$hashKey = 'test::usersAwardToHash'; //统计总数
+$listKey = 'test::userAwardList_'.$user['uid']; //记录用户领取信息
+
+for ($i=1; $i<=$run; $i++){
+    $award = roulette::factory()->run($user);
+    if (!empty($award)){
+        //领取记录
+        $redis->hIncrBy($hashKey, $user['uid'], 1);
+        $redis->rPush($listKey, $award['id']);
+    }else {
+        $error++;
+    }
+}
+
+$count = $redis->lLen($listKey);
+$result = $redis->lRange($listKey, 0, -1);
+
+$info = array_count_values($result);
+
+echo '本轮抽奖次数：'. $run.PHP_EOL;
+echo '本轮未中奖数：'. $error.PHP_EOL;
+echo '总中奖数：'. $count.PHP_EOL;
+echo '总中奖详情：'.PHP_EOL;
+ksort($info);
+foreach ($info as $k => $v){
+    switch ($k){
+        case '1':
+            echo '1元：'.$v.PHP_EOL;
+            break;
+        case '2':
+            echo '2元：'.$v.PHP_EOL;
+            break;
+        case '3':
+            echo '3元：'.$v.PHP_EOL;
+            break;
+        case '4':
+            echo '5元：'.$v.PHP_EOL;
+            break;
+        case '5':
+            echo '手表：'.$v.PHP_EOL;
+            break;
+        case '6':
+            echo '苹果手机：'.$v.PHP_EOL;
+            break;
+        default:
+            echo '谢谢参与';
+            break;
+    }
+}
+
+//重置
+$redis->flushDB();
+
+/**
+ * 测试结果，除阈值外其他奖励10%中奖率基本正常
+ *
+本轮抽奖次数：81100
+本轮未中奖数：73069
+总中奖数：8031
+总中奖详情：
+1元：4994
+2元：2000
+3元：500
+5元：485
+手表：50
+苹果手机：2
+ */
 
 echo "</pre>";
