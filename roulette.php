@@ -254,8 +254,8 @@ foreach ($info as $k => $v){
     }
 }
 
-//重置
-$redis->flushDB();
+//重置，慎用
+//$redis->flushDB();
 
 /**
  * 测试结果，除阈值外其他奖励10%中奖率基本正常
